@@ -21,3 +21,19 @@ Thumbs.db
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Capacitor / Android native project - the project itself is checked in,
+# but everything Gradle generates on build is not.
+android/**/build/
+android/**/.gradle/
+android/**/.cxx/
+android/local.properties
+android/.idea/
+android/*.iml
+android/**/*.iml
+android/captures/
+# `npx cap sync` copies the web build (see /build above) in here on every run.
+android/app/src/main/assets/public/
+
+# Claude Code session state
+.claude/

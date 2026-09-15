@@ -24,23 +24,16 @@ export type WeatherResponse = {
 	daily: DailyWeather;
 };
 
-/** A place from /api/search, which proxies Photon (OpenStreetMap data). */
-export type GeocodeResult = {
-	id: string;
-	name: string;
-	latitude: number;
-	longitude: number;
-	region: string;
-	country: string;
-};
-
-export type ReverseGeocodeResult = {
-	name: string;
-	region: string;
-	country: string;
-};
-
 export type Coordinates = { latitude: number; longitude: number };
+
+// Place search and reverse geocoding call Photon/Nominatim directly - see
+// geocode.ts for why, and for the ranking and fallback logic.
+export {
+	searchCity,
+	getLocationName,
+	type GeocodeResult,
+	type ReverseGeocodeResult
+} from './geocode';
 
 function isAbort(error: unknown) {
 	return (error as Error)?.name === 'AbortError';
@@ -91,92 +84,6 @@ export async function getWeather(
 			longitude,
 			error
 		});
-
-		throw error;
-	}
-}
-
-export async function getLocationName(
-	latitude: number,
-	longitude: number,
-	signal?: AbortSignal
-): Promise<{ results: ReverseGeocodeResult[] }> {
-	const url = new URLSearchParams({
-		latitude: latitude.toString(),
-		longitude: longitude.toString()
-	});
-
-	const requestUrl = `/api/reverse-geocode?${url.toString()}`;
-
-	try {
-		const response = await fetch(requestUrl, { signal });
-
-		if (!response.ok) {
-			console.error('[weather] Failed to fetch location name', {
-				url: requestUrl,
-				latitude,
-				longitude,
-				status: response.status,
-				statusText: response.statusText
-			});
-
-			throw new Error('Failed to fetch location name');
-		}
-
-		return await response.json();
-	} catch (error) {
-		if (isAbort(error)) throw error;
-
-		console.error('[weather] Reverse geocoding API call crashed', {
-			url: requestUrl,
-			latitude,
-			longitude,
-			error
-		});
-
-		throw error;
-	}
-}
-
-/**
- * Searches places via our own proxy rather than Open-Meteo's geocoder, which is
- * backed by GeoNames and has no record of smaller villages. Passing `near`
- * biases results towards the user, so a local village outranks a distant place
- * with the same name.
- */
-export async function searchCity(
-	cityName: string,
-	near?: Coordinates | null,
-	signal?: AbortSignal
-): Promise<{ results?: GeocodeResult[] }> {
-	const params = new URLSearchParams({ q: cityName });
-
-	if (near) {
-		params.set('lat', near.latitude.toString());
-		params.set('lon', near.longitude.toString());
-	}
-
-	const requestUrl = `/api/search?${params.toString()}`;
-
-	try {
-		const response = await fetch(requestUrl, { signal });
-
-		if (!response.ok) {
-			console.error('[weather] Failed to search places', {
-				url: requestUrl,
-				cityName,
-				status: response.status,
-				statusText: response.statusText
-			});
-
-			throw new Error('Failed to search places');
-		}
-
-		return await response.json();
-	} catch (error) {
-		if (isAbort(error)) throw error;
-
-		console.error('[weather] Place search crashed', { url: requestUrl, cityName, error });
 
 		throw error;
 	}

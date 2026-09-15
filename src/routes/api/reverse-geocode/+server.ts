@@ -1,67 +1,60 @@
 import { json } from '@sveltejs/kit';
+import { createCache } from '$lib/server/cache';
 import type { RequestHandler } from './$types';
 
-type ReverseGeocodeResponse = {
-	results: Array<{
-		name: string;
-	}>;
+export type ReverseGeocodeResult = {
+	name: string;
+	region: string;
+	country: string;
 };
 
 // Place names are effectively static, so we can cache hard.
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const CACHE_MAX_ENTRIES = 500;
+const cache = createCache<ReverseGeocodeResult>({
+	ttlMs: 24 * 60 * 60 * 1000,
+	maxEntries: 500
+});
 
-// 3 decimals is roughly 110m. Small enough that the resolved city/town name is
-// still correct near a boundary, large enough to absorb normal GPS jitter.
+// 3 decimals is roughly 110m. Small enough that the resolved name is still
+// correct near a boundary, large enough to absorb normal GPS jitter.
 const COORD_PRECISION = 3;
 
-const cache = new Map<string, { name: string; expiresAt: number }>();
+/**
+ * Most local name first. Nominatim returns whichever of these OSM admin levels
+ * exist at the point, and the broad ones are almost always present - so asking
+ * for `city` first meant a village like Avinashipalayam could lose to its
+ * district. Settlement names (village/hamlet/town) win, then sub-city areas,
+ * then the city itself.
+ */
+const NAME_KEYS = [
+	'village',
+	'hamlet',
+	'town',
+	'suburb',
+	'neighbourhood',
+	'city_district',
+	'city',
+	'municipality',
+	'county'
+] as const;
+
+const REGION_KEYS = ['state_district', 'state'] as const;
+
+type NominatimAddress = Record<string, string | undefined>;
 
 function cacheKey(latitude: number, longitude: number) {
 	return `${latitude.toFixed(COORD_PRECISION)},${longitude.toFixed(COORD_PRECISION)}`;
 }
 
-function readCache(key: string) {
-	const hit = cache.get(key);
-
-	if (!hit) return null;
-
-	if (hit.expiresAt <= Date.now()) {
-		cache.delete(key);
-		return null;
-	}
-
-	// Re-insert so the Map's insertion order doubles as LRU recency.
-	cache.delete(key);
-	cache.set(key, hit);
-
-	return hit.name;
-}
-
-function writeCache(key: string, name: string) {
-	cache.delete(key);
-	cache.set(key, { name, expiresAt: Date.now() + CACHE_TTL_MS });
-
-	while (cache.size > CACHE_MAX_ENTRIES) {
-		const oldest = cache.keys().next().value;
-
-		if (oldest === undefined) break;
-
-		cache.delete(oldest);
-	}
-}
-
-function respond(name: string, cacheStatus: 'HIT' | 'MISS') {
-	const result: ReverseGeocodeResponse = {
-		results: [{ name }]
-	};
-
-	return json(result, {
-		headers: {
-			'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
-			'X-Cache': cacheStatus
+function respond(result: ReverseGeocodeResult, cacheStatus: 'HIT' | 'MISS') {
+	return json(
+		{ results: [result] },
+		{
+			headers: {
+				'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800',
+				'X-Cache': cacheStatus
+			}
 		}
-	});
+	);
 }
 
 function failure(message: string, status: number) {
@@ -89,9 +82,9 @@ export const GET: RequestHandler = async ({ url, fetch }) => {
 	}
 
 	const key = cacheKey(latitude, longitude);
-	const cached = readCache(key);
+	const cached = cache.get(key);
 
-	if (cached !== null) {
+	if (cached) {
 		return respond(cached, 'HIT');
 	}
 
@@ -124,20 +117,27 @@ export const GET: RequestHandler = async ({ url, fetch }) => {
 		}
 
 		const payload = await response.json();
-		const address = payload?.address ?? {};
+		const address: NominatimAddress = payload?.address ?? {};
 
 		const name =
-			address.city ??
-			address.town ??
-			address.village ??
-			address.county ??
-			payload?.name ??
+			NAME_KEYS.map((nameKey) => address[nameKey]).find(Boolean) ??
+			(payload?.name || undefined) ??
 			payload?.display_name?.split(',')?.[0] ??
 			'Unknown location';
 
-		writeCache(key, name);
+		const regionParts = REGION_KEYS.map((regionKey) => address[regionKey]).filter(
+			(part): part is string => Boolean(part) && part !== name
+		);
 
-		return respond(name, 'MISS');
+		const result: ReverseGeocodeResult = {
+			name,
+			region: [...new Set(regionParts)].join(', '),
+			country: address.country ?? ''
+		};
+
+		cache.set(key, result);
+
+		return respond(result, 'MISS');
 	} catch (error) {
 		console.error('[reverse-geocode] Request crashed', {
 			url: endpoint.toString(),

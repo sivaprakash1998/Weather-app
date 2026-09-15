@@ -1,578 +1,602 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getLocationName, getWeather, searchCity } from '$lib/weather';
+	import { cubicOut } from 'svelte/easing';
+	import { prefersReducedMotion, Tween } from 'svelte/motion';
+	import {
+		getLocationName,
+		getWeather,
+		searchCity,
+		type CurrentWeather,
+		type Coordinates,
+		type GeocodeResult
+	} from '$lib/weather';
 
 	type ForecastDay = {
-		day: string;
+		date: string;
+		label: string;
 		icon: string;
 		high: number;
 		low: number;
+		rain: number | null;
 	};
 
-	type SearchResult = {
-		name: string;
-		latitude: number;
-		longitude: number;
-		country: string;
-		admin1?: string;
+	// WMO weather codes. The old mapping silently fell through to "Unknown" for
+	// freezing rain, snow grains and snow showers, and labelled overcast as
+	// "Partly Cloudy", so this table covers the full set Open-Meteo returns.
+	const WEATHER_CODES: Record<number, { label: string; icon: string; night?: string }> = {
+		0: { label: 'Clear sky', icon: '☀️', night: '🌙' },
+		1: { label: 'Mainly clear', icon: '🌤️', night: '🌙' },
+		2: { label: 'Partly cloudy', icon: '⛅', night: '☁️' },
+		3: { label: 'Overcast', icon: '☁️' },
+		45: { label: 'Foggy', icon: '🌫️' },
+		48: { label: 'Rime fog', icon: '🌫️' },
+		51: { label: 'Light drizzle', icon: '🌦️' },
+		53: { label: 'Drizzle', icon: '🌦️' },
+		55: { label: 'Dense drizzle', icon: '🌧️' },
+		56: { label: 'Freezing drizzle', icon: '🌧️' },
+		57: { label: 'Freezing drizzle', icon: '🌧️' },
+		61: { label: 'Light rain', icon: '🌦️' },
+		63: { label: 'Rain', icon: '🌧️' },
+		65: { label: 'Heavy rain', icon: '🌧️' },
+		66: { label: 'Freezing rain', icon: '🌧️' },
+		67: { label: 'Freezing rain', icon: '🌧️' },
+		71: { label: 'Light snow', icon: '🌨️' },
+		73: { label: 'Snow', icon: '❄️' },
+		75: { label: 'Heavy snow', icon: '❄️' },
+		77: { label: 'Snow grains', icon: '🌨️' },
+		80: { label: 'Light showers', icon: '🌦️' },
+		81: { label: 'Showers', icon: '🌧️' },
+		82: { label: 'Violent showers', icon: '⛈️' },
+		85: { label: 'Snow showers', icon: '🌨️' },
+		86: { label: 'Heavy snow showers', icon: '🌨️' },
+		95: { label: 'Thunderstorm', icon: '⛈️' },
+		96: { label: 'Thunderstorm, hail', icon: '⛈️' },
+		99: { label: 'Severe thunderstorm', icon: '⛈️' }
 	};
 
-	let city = $state('Getting location...');
-	let searchQuery = $state('');
-	let isSearching = $state(false);
+	let city = $state('');
+	let region = $state('');
+	let current = $state<CurrentWeather | null>(null);
+	let forecast = $state<ForecastDay[]>([]);
+	let sunrise = $state('');
+	let sunset = $state('');
+	let uvIndex = $state<number | null>(null);
+	let timezone = $state('');
+	let lastUpdated = $state<Date | null>(null);
+	// Last resolved position, used to bias place search towards the user.
+	let lastCoords = $state<Coordinates | null>(null);
+
 	let isLoadingWeather = $state(true);
 	let weatherError = $state('');
-	let searchResults = $state<SearchResult[]>([]);
 
-	let temperature = $state(0);
-	let condition = $state('Loading...');
-	let humidity = $state(0);
-	let windSpeed = $state(0);
-	let forecast = $state<ForecastDay[]>([]);
+	let searchQuery = $state('');
+	let searchResults = $state<GeocodeResult[]>([]);
+	let isSearching = $state(false);
+	let searchMessage = $state('');
+	let searchOpen = $state(false);
+	let searchContainer = $state<HTMLElement>();
 
-	function getWeatherCondition(code: number) {
-		if (code === 0) return 'Clear Sky';
-		if ([1, 2, 3].includes(code)) return 'Partly Cloudy';
-		if ([45, 48].includes(code)) return 'Foggy';
-		if ([51, 53, 55].includes(code)) return 'Drizzle';
-		if ([61, 63, 65].includes(code)) return 'Rain';
-		if ([71, 73, 75].includes(code)) return 'Snow';
-		if ([80, 81, 82].includes(code)) return 'Rain Showers';
-		if ([95, 96, 99].includes(code)) return 'Thunderstorm';
+	let theme = $state<'light' | 'dark'>('light');
 
-		return 'Unknown';
+	// Guards against a slow earlier response overwriting a newer one.
+	let weatherRequest: AbortController | null = null;
+	let searchRequest: AbortController | null = null;
+
+	const temperature = new Tween(0, { duration: 900, easing: cubicOut });
+
+	const condition = $derived(current ? describe(current.weather_code, current.is_day).label : '');
+	const conditionIcon = $derived(
+		current ? describe(current.weather_code, current.is_day).icon : ''
+	);
+
+	// Shared scale so every forecast bar is comparable against the others.
+	const scale = $derived.by(() => {
+		if (forecast.length === 0) return { min: 0, span: 1 };
+
+		const min = Math.min(...forecast.map((day) => day.low));
+		const max = Math.max(...forecast.map((day) => day.high));
+
+		return { min, span: max === min ? 1 : max - min };
+	});
+
+	// Fixed-length placeholder list for the forecast loading state.
+	const SKELETON_ROWS = [0, 1, 2, 3, 4];
+
+	const stats = $derived([
+		{
+			icon: '🌡️',
+			title: 'Feels like',
+			value: current ? `${Math.round(current.apparent_temperature)}°` : null,
+			desc: 'Apparent temp'
+		},
+		{
+			icon: '💧',
+			title: 'Humidity',
+			value: current ? `${current.relative_humidity_2m}%` : null,
+			desc: 'Air moisture'
+		},
+		{
+			icon: '💨',
+			title: 'Wind',
+			value: current ? `${Math.round(current.wind_speed_10m)}` : null,
+			desc: 'km/h at 10m'
+		},
+		{
+			icon: '☀️',
+			title: 'UV index',
+			value: uvIndex !== null ? `${Math.round(uvIndex)}` : null,
+			desc: 'Max today'
+		}
+	]);
+
+	function describe(code: number, isDay = 1) {
+		const entry = WEATHER_CODES[code] ?? { label: 'Unknown', icon: '🌤️' };
+
+		return { label: entry.label, icon: isDay === 0 && entry.night ? entry.night : entry.icon };
 	}
 
-	function getWeatherIcon(code: number) {
-		if (code === 0) return '☀️';
-		if ([1, 2, 3].includes(code)) return '⛅';
-		if ([45, 48].includes(code)) return '🌫️';
-		if ([51, 53, 55].includes(code)) return '🌦️';
-		if ([61, 63, 65].includes(code)) return '🌧️';
-		if ([71, 73, 75].includes(code)) return '❄️';
-		if ([80, 81, 82].includes(code)) return '🌦️';
-		if ([95, 96, 99].includes(code)) return '⛈️';
+	function formatClock(value: string | Date) {
+		const date = typeof value === 'string' ? new Date(value) : value;
 
-		return '🌤️';
+		return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 	}
 
-	async function loadWeather(latitude: number, longitude: number, selectedCity?: string) {
+	function isAbort(error: unknown) {
+		return (error as Error)?.name === 'AbortError';
+	}
+
+	async function loadWeather(
+		latitude: number,
+		longitude: number,
+		selectedCity?: string,
+		selectedRegion?: string
+	) {
+		weatherRequest?.abort();
+
+		const controller = new AbortController();
+		weatherRequest = controller;
+
 		isLoadingWeather = true;
 		weatherError = '';
+		lastCoords = { latitude, longitude };
 
 		if (selectedCity) {
 			city = selectedCity;
+			region = selectedRegion ?? '';
 		}
 
 		try {
-			const data = await getWeather(latitude, longitude);
+			const data = await getWeather(latitude, longitude, controller.signal);
 
-			temperature = Math.round(data.current.temperature_2m);
-			humidity = data.current.relative_humidity_2m;
-			windSpeed = Math.round(data.current.wind_speed_10m);
-			condition = getWeatherCondition(data.current.weather_code);
+			if (controller.signal.aborted) return;
 
-			forecast = data.daily.time.map((date: string, index: number) => ({
-				day: new Date(date).toLocaleDateString('en-US', { weekday: 'short' }),
-				icon: getWeatherIcon(data.daily.weather_code[index]),
+			current = data.current;
+			timezone = data.timezone ?? '';
+			uvIndex = data.daily.uv_index_max?.[0] ?? null;
+			sunrise = data.daily.sunrise?.[0] ?? '';
+			sunset = data.daily.sunset?.[0] ?? '';
+
+			forecast = data.daily.time.map((date, index) => ({
+				date,
+				// Parsed as local midnight, not UTC, so the weekday never slips a day.
+				label: new Date(`${date}T00:00:00`).toLocaleDateString('en-US', { weekday: 'short' }),
+				icon: describe(data.daily.weather_code[index]).icon,
 				high: Math.round(data.daily.temperature_2m_max[index]),
-				low: Math.round(data.daily.temperature_2m_min[index])
+				low: Math.round(data.daily.temperature_2m_min[index]),
+				rain: data.daily.precipitation_probability_max?.[index] ?? null
 			}));
+
+			temperature.set(Math.round(data.current.temperature_2m), {
+				duration: prefersReducedMotion.current ? 0 : 900
+			});
+
+			lastUpdated = new Date();
 
 			if (!selectedCity) {
 				try {
-					const locationData = await getLocationName(latitude, longitude);
-					city = locationData.results?.[0]?.name ?? 'Unknown location';
+					const locationData = await getLocationName(latitude, longitude, controller.signal);
+
+					if (!controller.signal.aborted) {
+						const place = locationData.results?.[0];
+						city = place?.name ?? 'Unknown location';
+						region = place ? [place.region, place.country].filter(Boolean).join(', ') : '';
+					}
 				} catch (error) {
+					if (isAbort(error)) return;
+
 					console.error('Location name lookup failed:', error);
 					city = 'Unknown location';
 				}
 			}
 		} catch (error) {
+			if (isAbort(error)) return;
+
 			console.error('Weather load failed:', error);
-			weatherError = 'Unable to load weather details right now. Please try again.';
-			condition = 'Unable to load weather';
+			weatherError = 'Unable to load weather right now. Please try again.';
 		} finally {
-			isLoadingWeather = false;
+			if (weatherRequest === controller) {
+				isLoadingWeather = false;
+				weatherRequest = null;
+			}
 		}
 	}
 
 	async function handleSearch() {
-		if (!searchQuery.trim()) return;
+		const query = searchQuery.trim();
+
+		if (!query) return;
+
+		searchRequest?.abort();
+
+		const controller = new AbortController();
+		searchRequest = controller;
 
 		isSearching = true;
+		searchMessage = '';
+		searchOpen = true;
 
 		try {
-			const data = await searchCity(searchQuery.trim());
+			const data = await searchCity(query, lastCoords, controller.signal);
+
+			if (controller.signal.aborted) return;
+
 			searchResults = data.results ?? [];
+			searchMessage = searchResults.length === 0 ? `No places found for ${query}.` : '';
 		} catch (error) {
+			if (isAbort(error)) return;
+
 			console.error('City search failed:', error);
 			searchResults = [];
+			searchMessage = 'Search failed. Check your connection and try again.';
 		} finally {
-			isSearching = false;
+			if (searchRequest === controller) {
+				isSearching = false;
+				searchRequest = null;
+			}
 		}
 	}
 
-	async function useCurrentLocation() {
+	async function selectSearchResult(result: GeocodeResult) {
+		searchQuery = '';
 		searchResults = [];
+		searchMessage = '';
+		searchOpen = false;
+
+		const label = [result.region, result.country].filter(Boolean).join(', ');
+
+		await loadWeather(result.latitude, result.longitude, result.name, label);
+	}
+
+	function useCurrentLocation() {
+		searchOpen = false;
+
 		if (!navigator.geolocation) {
-			condition = 'Location not supported';
-			city = 'Location unavailable';
-			weatherError = 'Your browser does not support geolocation.';
+			weatherError = 'Your browser does not support geolocation. Search for a city instead.';
 			isLoadingWeather = false;
 			return;
 		}
 
-		city = 'Getting location...';
+		isLoadingWeather = true;
+		weatherError = '';
 
 		navigator.geolocation.getCurrentPosition(
-			async (position) => {
+			(position) => {
 				const { latitude, longitude } = position.coords;
-				await loadWeather(latitude, longitude);
+				loadWeather(latitude, longitude);
 			},
 			(error) => {
 				console.error('Location error:', error);
-				condition = 'Unable to get location';
-				city = 'Location unavailable';
-				weatherError = 'Location access was denied or unavailable.';
+				weatherError = 'Location access was denied. Search for a city instead.';
 				isLoadingWeather = false;
-			}
+			},
+			{ timeout: 10000, maximumAge: 300000 }
 		);
 	}
 
-	async function selectSearchResult(result: SearchResult) {
-		searchQuery = '';
-		searchResults = [];
-		await loadWeather(result.latitude, result.longitude, result.name);
+	function toggleTheme() {
+		theme = theme === 'dark' ? 'light' : 'dark';
+		document.documentElement.dataset.theme = theme;
+
+		try {
+			localStorage.setItem('skypulse-theme', theme);
+		} catch {
+			// Private mode or blocked storage. The toggle still works for this visit.
+		}
 	}
 
-	onMount(async () => {
-		await useCurrentLocation();
+	function handleWindowClick(event: MouseEvent) {
+		if (!searchOpen || !searchContainer) return;
+
+		if (!searchContainer.contains(event.target as Node)) {
+			searchOpen = false;
+		}
+	}
+
+	function handleWindowKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') searchOpen = false;
+	}
+
+	onMount(() => {
+		theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+		useCurrentLocation();
 	});
 </script>
 
+<svelte:window onclick={handleWindowClick} onkeydown={handleWindowKeydown} />
+
 <svelte:head>
-	<title>Weather | DaisyUI Edition</title>
+	<title>SkyPulse — Live Weather</title>
 	<meta
 		name="description"
-		content="Responsive weather experience with DaisyUI components and real-time city search"
+		content="A fast, responsive weather app with current conditions, a 5 day forecast and city search."
 	/>
 </svelte:head>
 
-<main class="weather-page">
-	<div class="weather-shell weather-grid">
-		<section class="glass-panel panel hero-panel">
-			<div class="hero-head">
+<div class="min-h-dvh px-4 py-5 sm:px-6 lg:py-8">
+	<div class="mx-auto flex max-w-6xl flex-col gap-5">
+		<header class="navbar rise glass min-h-0 rounded-3xl px-3 py-2 shadow-lg">
+			<div class="navbar-start gap-2.5">
+				<span class="float-gentle text-3xl" aria-hidden="true">🌤️</span>
 				<div>
-					<p class="eyebrow">LIVE WEATHER</p>
-					<h1>SkyPulse</h1>
+					<p class="text-[0.6rem] font-bold tracking-[0.22em] opacity-55">LIVE WEATHER</p>
+					<h1 class="text-xl leading-none font-black">SkyPulse</h1>
 				</div>
-				<button class="location-btn" onclick={useCurrentLocation} aria-label="Use current location"
-					>📍</button
-				>
 			</div>
 
-			<div class="search-row">
-				<input
-					class="search-input"
-					bind:value={searchQuery}
-					placeholder="Search city..."
-					onkeydown={(event) => {
-						if (event.key === 'Enter') {
-							handleSearch();
-						}
-					}}
-				/>
-				<button class="search-btn" onclick={handleSearch} aria-label="Search city">
-					{#if isSearching}
-						<span class="loader-dot" aria-hidden="true"></span>
-						Searching
+			<div class="navbar-end gap-1">
+				<button
+					class="btn btn-circle btn-ghost"
+					onclick={useCurrentLocation}
+					disabled={isLoadingWeather}
+					aria-label="Refresh using my current location"
+				>
+					{#if isLoadingWeather}
+						<span class="loading loading-spinner loading-sm"></span>
 					{:else}
-						Search
+						<span class="text-lg" aria-hidden="true">🔄</span>
 					{/if}
+				</button>
+
+				<label class="btn btn-circle btn-ghost swap swap-rotate">
+					<input
+						type="checkbox"
+						checked={theme === 'dark'}
+						onchange={toggleTheme}
+						aria-label="Toggle dark mode"
+					/>
+					<span class="swap-off text-lg" aria-hidden="true">🌞</span>
+					<span class="swap-on text-lg" aria-hidden="true">🌚</span>
+				</label>
+			</div>
+		</header>
+
+		<div class="rise relative z-20" style="--d:70ms" bind:this={searchContainer}>
+			<div class="flex flex-col gap-2 sm:flex-row">
+				<div class="join flex-1 shadow-lg">
+					<input
+						class="input join-item w-full"
+						type="search"
+						autocomplete="off"
+						placeholder="Search any city…"
+						aria-label="Search for a city"
+						bind:value={searchQuery}
+						onfocus={() => {
+							if (searchResults.length > 0 || searchMessage) searchOpen = true;
+						}}
+						onkeydown={(event) => {
+							if (event.key === 'Enter') handleSearch();
+						}}
+					/>
+					<button
+						class="btn join-item btn-primary"
+						onclick={handleSearch}
+						disabled={isSearching || !searchQuery.trim()}
+					>
+						{#if isSearching}
+							<span class="loading loading-spinner loading-xs"></span>
+							Searching
+						{:else}
+							Search
+						{/if}
+					</button>
+				</div>
+
+				<button class="btn btn-soft btn-secondary shadow-lg" onclick={useCurrentLocation}>
+					<span aria-hidden="true">📍</span>
+					My location
 				</button>
 			</div>
 
-			{#if searchResults.length > 0}
-				<div class="results-panel glass-panel">
-					{#each searchResults as result (result.name + '-' + result.latitude + '-' + result.longitude)}
-						<button class="result-item" onclick={() => selectSearchResult(result)}>
-							<strong>{result.name}</strong>
-							<small>{result.admin1 ? `${result.admin1}, ` : ''}{result.country}</small>
-						</button>
+			{#if searchOpen && (searchResults.length > 0 || searchMessage)}
+				<div
+					class="bg-base-100 border-base-content/10 absolute top-full right-0 left-0 z-30 mt-2 overflow-hidden rounded-2xl border shadow-2xl"
+				>
+					{#if searchResults.length > 0}
+						<ul class="menu w-full p-2">
+							{#each searchResults as result (result.id)}
+								<li>
+									<button
+										class="flex flex-col items-start gap-0"
+										onclick={() => selectSearchResult(result)}
+									>
+										<span class="font-semibold">{result.name}</span>
+										<span class="text-xs opacity-65">
+											{[result.region, result.country].filter(Boolean).join(', ')}
+										</span>
+									</button>
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<p class="px-4 py-3 text-sm opacity-70">{searchMessage}</p>
+					{/if}
+				</div>
+			{/if}
+		</div>
+
+		{#if weatherError}
+			<div role="alert" class="alert alert-error rise shadow-lg">
+				<span aria-hidden="true">⚠️</span>
+				<span>{weatherError}</span>
+				<button class="btn btn-sm btn-ghost" onclick={useCurrentLocation}>Retry</button>
+			</div>
+		{/if}
+
+		<div class="grid gap-5 lg:grid-cols-[1.05fr_0.95fr]">
+			<section
+				class="card hero-sky rise overflow-hidden text-white shadow-2xl {isLoadingWeather
+					? 'sweep'
+					: ''}"
+				style="--d:120ms"
+				aria-busy={isLoadingWeather}
+			>
+				<div class="card-body justify-between gap-5">
+					<div class="flex items-start justify-between gap-3">
+						<div class="min-w-0">
+							{#if city}
+								<h2 class="truncate text-2xl font-bold">{city}</h2>
+								{#if region}
+									<p class="truncate text-sm opacity-80">{region}</p>
+								{/if}
+							{:else}
+								<div class="skeleton h-7 w-40 bg-white/25"></div>
+							{/if}
+						</div>
+
+						{#if isLoadingWeather}
+							<span class="badge badge-sm gap-1.5 border-0 bg-white/25 text-white">
+								<span class="loading loading-spinner loading-xs"></span>
+								Updating
+							</span>
+						{:else if lastUpdated}
+							<span class="badge badge-sm border-0 bg-white/20 text-white">
+								{formatClock(lastUpdated)}
+							</span>
+						{/if}
+					</div>
+
+					<div class="flex items-center justify-center gap-4 py-3">
+						{#if current}
+							<div class="relative grid place-items-center">
+								<span class="halo absolute h-20 w-20 rounded-full bg-white/30 blur-2xl"></span>
+								<span class="float-gentle relative text-6xl sm:text-7xl" aria-hidden="true">
+									{conditionIcon}
+								</span>
+							</div>
+							<p class="text-7xl leading-none font-black tracking-tight tabular-nums sm:text-8xl">
+								{Math.round(temperature.current)}°
+							</p>
+						{:else}
+							<div class="skeleton h-20 w-20 rounded-full bg-white/25"></div>
+							<div class="skeleton h-20 w-36 bg-white/25"></div>
+						{/if}
+					</div>
+
+					<div class="text-center">
+						{#if current}
+							<p class="text-lg font-semibold">{condition}</p>
+							{#if forecast[0]}
+								<p class="text-sm opacity-80">
+									High {forecast[0].high}° · Low {forecast[0].low}°
+								</p>
+							{/if}
+						{:else}
+							<div class="skeleton mx-auto h-5 w-32 bg-white/25"></div>
+						{/if}
+					</div>
+
+					{#if sunrise && sunset}
+						<div class="mt-1 flex justify-center gap-6 border-t border-white/20 pt-3 text-sm">
+							<span class="flex items-center gap-1.5">
+								<span aria-hidden="true">🌅</span> Sunrise {formatClock(sunrise)}
+							</span>
+							<span class="flex items-center gap-1.5">
+								<span aria-hidden="true">🌇</span> Sunset {formatClock(sunset)}
+							</span>
+						</div>
+					{/if}
+				</div>
+			</section>
+
+			<div class="flex flex-col gap-5">
+				<div class="grid grid-cols-2 gap-3 sm:gap-4">
+					{#each stats as stat, index (stat.title)}
+						<div class="stats rise glass rounded-2xl shadow-lg" style="--d:{160 + index * 60}ms">
+							<div class="stat gap-0.5 px-4 py-3">
+								<div class="stat-figure text-xl opacity-80" aria-hidden="true">{stat.icon}</div>
+								<div class="stat-title text-xs">{stat.title}</div>
+								{#if stat.value !== null}
+									<div class="stat-value text-2xl tabular-nums">{stat.value}</div>
+								{:else}
+									<div class="skeleton my-1 h-7 w-16"></div>
+								{/if}
+								<div class="stat-desc text-[0.7rem]">{stat.desc}</div>
+							</div>
+						</div>
 					{/each}
 				</div>
-			{/if}
 
-			{#if weatherError}
-				<div class="error-banner">{weatherError}</div>
-			{/if}
+				<section class="card rise glass rounded-3xl shadow-lg" style="--d:400ms">
+					<div class="card-body gap-3 p-4 sm:p-5">
+						<div class="flex items-center justify-between gap-2">
+							<h3 class="card-title text-lg">5-Day Forecast</h3>
+							{#if timezone}
+								<span class="badge badge-ghost badge-sm">{timezone.replace('_', ' ')}</span>
+							{/if}
+						</div>
 
-			<div class="current-card {isLoadingWeather ? 'loading-shimmer' : ''}">
-				<div class="city-row">
-					<p>📍 {city}</p>
-					{#if isLoadingWeather}
-						<span class="pulse-pill">Updating…</span>
-					{/if}
-				</div>
-				<div class="temp-wrap">
-					<span class="float-gentle weather-emoji">{forecast[0]?.icon ?? '🌤️'}</span>
-					<h2>{temperature}°</h2>
-				</div>
-				<p class="condition-tag">{condition}</p>
-			</div>
-		</section>
-
-		<section class="metrics-column">
-			<div class="glass-panel panel stat-grid">
-				<div class="stat-card">
-					<span>Humidity</span>
-					<strong>{humidity}%</strong>
-					<small>Air moisture</small>
-				</div>
-				<div class="stat-card">
-					<span>Wind</span>
-					<strong>{windSpeed} km/h</strong>
-					<small>Current speed</small>
-				</div>
-				<div class="stat-card">
-					<span>Status</span>
-					<strong>{isLoadingWeather ? 'Updating...' : 'Ready'}</strong>
-					<small>Live sync</small>
-				</div>
-			</div>
-
-			<div class="glass-panel panel">
-				<div class="forecast-head">
-					<h3>5 Day Forecast</h3>
-					<span>Next days</span>
-				</div>
-
-				<div class="forecast-list">
-					{#if forecast.length === 0 && isLoadingWeather}
-						<div class="forecast-skeleton loading-shimmer"></div>
-						<div class="forecast-skeleton loading-shimmer"></div>
-						<div class="forecast-skeleton loading-shimmer"></div>
-						<div class="forecast-skeleton loading-shimmer"></div>
-					{:else}
-						{#each forecast as day (day.day)}
-							<div class="forecast-item">
-								<div>
-									<span class="icon">{day.icon}</span>
-									<strong>{day.day}</strong>
-								</div>
-								<p>{day.high}° / {day.low}°</p>
+						{#if forecast.length === 0}
+							<div class="flex flex-col gap-2.5" aria-hidden="true">
+								{#each SKELETON_ROWS as row (row)}
+									<div class="skeleton h-11 w-full rounded-xl"></div>
+								{/each}
 							</div>
-						{/each}
-					{/if}
-				</div>
+						{:else}
+							<ul class="flex flex-col gap-1">
+								{#each forecast as day, index (day.date)}
+									<li
+										class="hover:bg-base-content/5 flex items-center gap-2.5 rounded-xl px-2 py-2.5 transition-colors sm:gap-3"
+									>
+										<span class="w-9 text-sm font-semibold opacity-80">{day.label}</span>
+										<span class="text-xl" aria-hidden="true">{day.icon}</span>
+										<span class="text-info w-9 text-[0.7rem] font-medium tabular-nums">
+											{day.rain !== null && day.rain > 15 ? `${day.rain}%` : ''}
+										</span>
+										<span class="w-8 text-right text-sm tabular-nums opacity-60">{day.low}°</span>
+										<div class="bg-base-content/10 relative h-1.5 flex-1 rounded-full">
+											<div
+												class="bar-fill from-secondary to-accent absolute h-full rounded-full bg-gradient-to-r"
+												style="left:{((day.low - scale.min) / scale.span) * 100}%; width:{Math.max(
+													((day.high - day.low) / scale.span) * 100,
+													6
+												)}%; --d:{450 + index * 80}ms"
+											></div>
+										</div>
+										<span class="w-8 text-sm font-bold tabular-nums">{day.high}°</span>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</div>
+				</section>
 			</div>
-		</section>
+		</div>
+
+		<footer class="rise pb-2 text-center text-xs opacity-55" style="--d:520ms">
+			Weather by Open-Meteo · Places by OpenStreetMap Nominatim
+		</footer>
 	</div>
-</main>
+</div>
 
 <style>
-	.weather-page {
-		min-height: 100vh;
-		padding: clamp(1rem, 2vw, 2rem);
-	}
-
-	.weather-grid {
-		max-width: 1080px;
-		margin: 0 auto;
-		display: grid;
-		gap: 1.25rem;
-		grid-template-columns: 1fr;
-	}
-
-	.panel {
-		border: 1px solid rgba(79, 70, 229, 0.18);
-		border-radius: 1.4rem;
-		padding: 1.2rem;
-		box-shadow: 0 16px 45px rgba(15, 23, 42, 0.13);
-	}
-
-	.hero-panel {
-		display: flex;
-		flex-direction: column;
-		gap: 1rem;
-	}
-
-	.hero-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-	}
-
-	.eyebrow {
-		letter-spacing: 0.15em;
-		font-size: 0.78rem;
-		font-weight: 800;
-		margin: 0;
-	}
-
-	h1 {
-		font-size: clamp(2rem, 4vw, 2.8rem);
-		margin: 0.2rem 0 0;
-		line-height: 1;
-	}
-
-	.location-btn {
-		border: 0;
-		background: linear-gradient(135deg, #5b6cff, #22d3ee);
-		color: white;
-		width: 2.8rem;
-		height: 2.8rem;
-		border-radius: 999px;
-		cursor: pointer;
-		font-size: 1.1rem;
-		box-shadow: 0 10px 25px rgba(91, 108, 255, 0.35);
-	}
-
-	.search-row {
-		display: grid;
-		grid-template-columns: 1fr auto;
-		gap: 0.7rem;
-	}
-
-	.search-input {
-		width: 100%;
-		border: 1px solid rgba(148, 163, 184, 0.4);
-		border-radius: 0.9rem;
-		padding: 0.82rem 0.95rem;
-		font-size: 1rem;
-		outline: none;
-		background: rgba(255, 255, 255, 0.9);
-	}
-
-	.search-input:focus {
-		border-color: rgba(91, 108, 255, 0.7);
-		box-shadow: 0 0 0 3px rgba(91, 108, 255, 0.16);
-	}
-
-	.search-btn {
-		border: 0;
-		border-radius: 0.9rem;
-		padding: 0.82rem 1rem;
-		font-weight: 700;
-		cursor: pointer;
-		background: linear-gradient(135deg, #4338ca, #5b6cff);
-		color: #fff;
-		display: inline-flex;
-		align-items: center;
-		gap: 0.45rem;
-	}
-
-	.loader-dot {
-		width: 0.9rem;
-		height: 0.9rem;
-		border: 2px solid rgba(255, 255, 255, 0.35);
-		border-top-color: #fff;
-		border-radius: 999px;
-		animation: spin 0.8s linear infinite;
-	}
-
-	.results-panel {
-		border-radius: 1rem;
-		overflow: hidden;
-		border: 1px solid rgba(148, 163, 184, 0.25);
-	}
-
-	.result-item {
-		width: 100%;
-		border: 0;
-		background: transparent;
-		padding: 0.8rem 0.9rem;
-		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		gap: 0.1rem;
-		cursor: pointer;
-	}
-
-	.result-item:hover {
-		background: rgba(91, 108, 255, 0.08);
-	}
-
-	.result-item small {
-		opacity: 0.75;
-	}
-
-	.error-banner {
-		border-radius: 0.9rem;
-		padding: 0.75rem 0.9rem;
-		background: rgba(239, 68, 68, 0.14);
-		color: #b91c1c;
-		font-weight: 600;
-		font-size: 0.9rem;
-	}
-
-	.current-card {
-		border-radius: 1.2rem;
-		padding: 1.1rem;
-		background: linear-gradient(145deg, #4f46e5 0%, #0ea5e9 55%, #14b8a6 100%);
-		color: white;
-	}
-
-	.city-row {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		gap: 0.8rem;
-	}
-
-	.city-row p {
-		margin: 0;
-		font-weight: 600;
-	}
-
-	.pulse-pill {
-		font-size: 0.75rem;
-		font-weight: 700;
-		padding: 0.3rem 0.6rem;
-		border-radius: 999px;
-		background: rgba(255, 255, 255, 0.22);
-		animation: pulse 1.6s infinite;
-	}
-
-	.temp-wrap {
-		display: flex;
-		justify-content: center;
-		align-items: center;
-		gap: 0.5rem;
-		margin: 0.7rem 0;
-	}
-
-	.weather-emoji {
-		font-size: 2rem;
-	}
-
-	.temp-wrap h2 {
-		font-size: clamp(3rem, 8vw, 4.6rem);
-		line-height: 1;
-		margin: 0;
-	}
-
-	.condition-tag {
-		margin: 0;
-		text-align: center;
-		font-weight: 600;
-		opacity: 0.92;
-	}
-
-	.metrics-column {
-		display: grid;
-		gap: 1.25rem;
-	}
-
-	.stat-grid {
-		display: grid;
-		grid-template-columns: repeat(3, minmax(0, 1fr));
-		gap: 0.7rem;
-	}
-
-	.stat-card {
-		border-radius: 1rem;
-		padding: 0.9rem;
-		background: rgba(255, 255, 255, 0.74);
-		display: grid;
-		gap: 0.2rem;
-	}
-
-	.stat-card span {
-		font-size: 0.85rem;
-		opacity: 0.75;
-	}
-
-	.stat-card strong {
-		font-size: 1.35rem;
-	}
-
-	.stat-card small {
-		opacity: 0.7;
-	}
-
-	.forecast-head {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		margin-bottom: 0.8rem;
-	}
-
-	.forecast-head h3 {
-		margin: 0;
-		font-size: 1.55rem;
-	}
-
-	.forecast-head span {
-		font-size: 0.9rem;
-		opacity: 0.7;
-	}
-
-	.forecast-list {
-		display: grid;
-		gap: 0.65rem;
-	}
-
-	.forecast-item {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		padding: 0.85rem 0.95rem;
-		border-radius: 1rem;
-		border: 1px solid rgba(148, 163, 184, 0.22);
-		background: rgba(255, 255, 255, 0.85);
-		transition:
-			transform 0.25s ease,
-			box-shadow 0.25s ease;
-	}
-
-	.forecast-item:hover {
-		transform: translateY(-2px);
-		box-shadow: 0 10px 24px rgba(15, 23, 42, 0.1);
-	}
-
-	.forecast-item .icon {
-		margin-right: 0.6rem;
-		font-size: 1.25rem;
-	}
-
-	.forecast-item p {
-		margin: 0;
-		font-weight: 700;
-	}
-
-	.forecast-skeleton {
-		height: 4rem;
-		border-radius: 1rem;
-		background: rgba(226, 232, 240, 0.68);
-	}
-
-	@media (max-width: 680px) {
-		.stat-grid {
-			grid-template-columns: 1fr;
-		}
-	}
-
-	@media (min-width: 960px) {
-		.weather-grid {
-			grid-template-columns: 1.08fr 0.92fr;
-		}
-	}
-
-	@keyframes spin {
-		to {
-			transform: rotate(360deg);
-		}
-	}
-
-	@keyframes pulse {
-		0%,
-		100% {
-			opacity: 0.65;
-		}
-		50% {
-			opacity: 1;
-		}
+	/* Fixed gradient rather than theme tokens: these stops sit in the 48-56%
+	   lightness band, which keeps white text readable in both themes. */
+	.hero-sky {
+		background-image: linear-gradient(
+			140deg,
+			oklch(48% 0.2 275) 0%,
+			oklch(52% 0.15 232) 55%,
+			oklch(56% 0.13 196) 100%
+		);
 	}
 </style>

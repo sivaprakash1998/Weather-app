@@ -3,7 +3,10 @@ export async function getWeather(latitude: number, longitude: number) {
 
 	url.searchParams.set('latitude', latitude.toString());
 	url.searchParams.set('longitude', longitude.toString());
-	url.searchParams.set('current', 'temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code');
+	url.searchParams.set(
+		'current',
+		'temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code'
+	);
 	url.searchParams.set('daily', 'weather_code,temperature_2m_max,temperature_2m_min');
 	url.searchParams.set('forecast_days', '5');
 	url.searchParams.set('timezone', 'auto');
@@ -73,9 +76,7 @@ export async function getLocationName(latitude: number, longitude: number) {
 }
 
 export async function searchCity(cityName: string) {
-	const url = new URL(
-		'https://geocoding-api.open-meteo.com/v1/search'
-	);
+	const url = new URL('https://geocoding-api.open-meteo.com/v1/search');
 
 	url.searchParams.set('name', cityName);
 	url.searchParams.set('count', '5');

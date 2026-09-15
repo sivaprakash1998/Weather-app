@@ -167,7 +167,9 @@
 					<p class="eyebrow">LIVE WEATHER</p>
 					<h1>SkyPulse</h1>
 				</div>
-				<button class="location-btn" onclick={useCurrentLocation} aria-label="Use current location">📍</button>
+				<button class="location-btn" onclick={useCurrentLocation} aria-label="Use current location"
+					>📍</button
+				>
 			</div>
 
 			<div class="search-row">
@@ -520,7 +522,9 @@
 		border-radius: 1rem;
 		border: 1px solid rgba(148, 163, 184, 0.22);
 		background: rgba(255, 255, 255, 0.85);
-		transition: transform 0.25s ease, box-shadow 0.25s ease;
+		transition:
+			transform 0.25s ease,
+			box-shadow 0.25s ease;
 	}
 
 	.forecast-item:hover {

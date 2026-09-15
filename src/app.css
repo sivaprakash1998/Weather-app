@@ -1,7 +1,13 @@
 @import 'tailwindcss';
 
 :root {
-	--app-gradient: radial-gradient(circle at 10% 20%, #c7d2fe 0%, #e0f2fe 30%, #fdf4ff 60%, #ffffff 100%);
+	--app-gradient: radial-gradient(
+		circle at 10% 20%,
+		#c7d2fe 0%,
+		#e0f2fe 30%,
+		#fdf4ff 60%,
+		#ffffff 100%
+	);
 }
 
 body {

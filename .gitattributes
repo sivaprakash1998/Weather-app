@@ -1,0 +1,13 @@
+# Normalize all text files to LF in the repo, regardless of checkout platform.
+# Prettier writes LF by default, so this keeps `prettier --check` stable
+# across Windows and non-Windows machines.
+* text=auto eol=lf
+
+*.svg text
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
